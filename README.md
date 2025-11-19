@@ -1,6 +1,6 @@
 # UIVO – Attack Surface & Recon Framework
 
-**UIVO** é um framework avançado para mapeamento de superfície de ataque, automação de recon e varreduras de segurança.  
+**UIVO** é um iniciativa para mapeamento de superfície de ataque, automação de recon e varreduras de segurança.  
 Ele combina subdomain enumeration, DNS/SSL/HTTP fingerprinting, Shodan, WPScan, Nuclei e análise de JavaScript para detecção de chaves expostas.
 
 ![uivo](uivo.png)
