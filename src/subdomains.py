@@ -58,3 +58,12 @@ def brute_force_subdomains(domain: str, wordlist: str | None = None, threads: in
         executor.map(worker, wl)
 
     return sorted(set(subs))
+
+def enum_html_search(domain: str) -> list[str]:
+    """Optional HTML-based subdomain enumeration.
+
+    At the moment this função é apenas um stub e retorna uma lista vazia.
+    Isso evita erros quando o plugin de subdomínios tenta chamar
+    src.subdomains.enum_html_search sem que haja implementação real.
+    """
+    return []

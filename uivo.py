@@ -133,23 +133,40 @@ def enum_html_subdomains(domain: str, base_url: str, timeout: float = 15.0) -> l
     return sorted(subs)
 
 
-def classify_subdomains_activity(subdomains: list[str], threads: int = 10) -> tuple[list[str], list[str]]:
-    """
-    Verifica se os subdomínios respondem em HTTP/HTTPS simples (HEAD/GET),
-    classificando em ativos e inativos.
+def classify_subdomains_activity(subdomains: list[str], threads: int = 10) -> tuple[list[str], list[str], dict[str, dict]]:
+    """Verifica se os subdomínios respondem em HTTP/HTTPS e coleta alguns cabeçalhos.
+
+    Retorna (ativos, inativos, http_info), onde http_info[host] contém:
+      - url: URL utilizada no teste
+      - status: código HTTP (quando disponível)
+      - headers: dicionário de cabeçalhos (lowercase)
+      - error: mensagem de erro (quando não houver resposta)
     """
     active: list[str] = []
     inactive: list[str] = []
+    http_info: dict[str, dict] = {}
 
     def check(sub: str) -> tuple[str, bool]:
         urls = [f"http://{sub}", f"https://{sub}"]
+        last_error: str | None = None
         for u in urls:
             try:
                 r = requests.get(u, timeout=5, verify=False)
                 if r.status_code < 600:
+                    headers = {k.lower(): v for k, v in (r.headers or {}).items()}
+                    http_info[sub] = {
+                        "url": u,
+                        "status": r.status_code,
+                        "headers": headers,
+                    }
                     return sub, True
-            except Exception:
+            except Exception as e:
+                last_error = str(e)
                 continue
+        http_info[sub] = {
+            "url": urls[0],
+            "error": last_error or "unreachable",
+        }
         return sub, False
 
     with ThreadPoolExecutor(max_workers=threads) as executor:
@@ -159,7 +176,8 @@ def classify_subdomains_activity(subdomains: list[str], threads: int = 10) -> tu
             else:
                 inactive.append(sub)
 
-    return active, inactive
+    return active, inactive, http_info
+
 
 
 
@@ -223,14 +241,34 @@ def get_http_information(domain: str) -> Dict[str, Any]:
 def find_or_install_nuclei(nuclei_bin: str, auto_install: bool) -> Optional[str]:
     explicit = Path(nuclei_bin)
     if explicit.is_file() and os.access(explicit, os.X_OK):
+        # binário informado explicitamente
+        try:
+            out = run_command([str(explicit), "--version"], timeout=20)
+            print(out)
+        except Exception:
+            pass
         return str(explicit)
+
     path = shutil.which(nuclei_bin)
     if path:
+        # encontrado no PATH
+        try:
+            out = run_command([path, "--version"], timeout=20)
+            print(out)
+        except Exception:
+            pass
         return path
+
     nuclei_dir = Path('nuclei')
     local_bin = nuclei_dir / 'nuclei'
     if local_bin.is_file() and os.access(local_bin, os.X_OK):
+        try:
+            out = run_command([str(local_bin), "--version"], timeout=20)
+            print(out)
+        except Exception:
+            pass
         return str(local_bin)
+
     print('[!] Nuclei não encontrado em PATH nem em ./nuclei')
     if not auto_install:
         try:
@@ -250,7 +288,6 @@ def find_or_install_nuclei(nuclei_bin: str, auto_install: bool) -> Optional[str]
         print('[!] Repositório Nuclei clonado, mas o binário nuclei não foi encontrado em ./nuclei/nuclei')
         return None
     return str(local_bin)
-
 def run_nuclei(bin_path: str, targets: List[str], profile: str='pentest', timeout: int=900) -> str:
     """
     Executa Nuclei contra a lista de targets.
@@ -278,7 +315,7 @@ def run_wpscan(url: str, api_token: Optional[str]) -> Dict[str, Any]:
     if not wpscan_bin:
         res['error'] = 'wpscan binary not found in PATH'
         return res
-    cmd = [wpscan_bin, '--no-update', '--url', url]
+    cmd = [wpscan_bin, '--no-update', '--random-user-agent', '--disable-tls-checks', '--url', url]
     if api_token:
         cmd.extend(['--api-token', api_token])
     res['cmd'] = cmd
@@ -430,22 +467,115 @@ def generate_html_report(domain: str, results: Dict[str, Any], out_dir: Path) ->
     subs_all = results.get('subdomains') or []
     subs_active = results.get('subdomains_active') or []
     subs_inactive = results.get('subdomains_inactive') or []
+    subs_http_info = results.get('subdomains_http_info') or {}
+
     active_rows = []
     for s in subs_active:
         host = str(s).strip()
-        http = f'http://{host}'
-        https = f'https://{host}'
-        active_rows.append(f"<tr><td>{html_escape(host)}</td><td><a href='{html_escape(http)}' target='_blank'>HTTP</a></td><td><a href='{html_escape(https)}' target='_blank'>HTTPS</a></td></tr>")
+        if not host:
+            continue
+        http = f"http://{host}"
+        https = f"https://{host}"
+        info = subs_http_info.get(host, {}) or {}
+        poc = info.get("clickj_poc")
+        if poc:
+            cj_link = f"<a href='{html_escape(poc)}' target='_blank'>PoC</a>"
+        else:
+            cj_link = "<span class='text-muted'>-</span>"
+        active_rows.append(
+            "<tr>"
+            f"<td>{html_escape(host)}</td>"
+            f"<td><a href='{html_escape(http)}' target='_blank'>HTTP</a></td>"
+            f"<td><a href='{html_escape(https)}' target='_blank'>HTTPS</a></td>"
+            f"<td>{cj_link}</td>"
+            "</tr>"
+        )
+
     inactive_rows = []
     for s in subs_inactive:
         host = str(s).strip()
-        http = f'http://{host}'
-        https = f'https://{host}'
-        inactive_rows.append(f"<tr><td>{html_escape(host)}</td><td><a href='{html_escape(http)}' target='_blank'>HTTP</a></td><td><a href='{html_escape(https)}' target='_blank'>HTTPS</a></td></tr>")
+        if not host:
+            continue
+        http = f"http://{host}"
+        https = f"https://{host}"
+        info = subs_http_info.get(host, {}) or {}
+        poc = info.get("clickj_poc")
+        if poc:
+            cj_link = f"<a href='{html_escape(poc)}' target='_blank'>PoC</a>"
+        else:
+            cj_link = "<span class='text-muted'>-</span>"
+        inactive_rows.append(
+            "<tr>"
+            f"<td>{html_escape(host)}</td>"
+            f"<td><a href='{html_escape(http)}' target='_blank'>HTTP</a></td>"
+            f"<td><a href='{html_escape(https)}' target='_blank'>HTTPS</a></td>"
+            f"<td>{cj_link}</td>"
+            "</tr>"
+        )
+
     if subs_all:
-        subs_section = f"""\n        <div class="card mb-4">\n          <div class="card-header d-flex justify-content-between align-items-center">\n            <h2 class="h6 mb-0">Subdomains</h2>\n            <small class="text-muted">\n              Total: {len(subs_all)} | Active: {len(subs_active)} | Inactive: {len(subs_inactive)}\n            </small>\n          </div>\n          <div class="card-body">\n            <ul class="nav nav-tabs" id="subsTabs" role="tablist">\n              <li class="nav-item" role="presentation">\n                <button class="nav-link active" id="subs-active-tab" data-bs-toggle="tab"\n                        data-bs-target="#subs-active" type="button" role="tab">\n                  Active ({len(subs_active)})\n                </button>\n              </li>\n              <li class="nav-item" role="presentation">\n                <button class="nav-link" id="subs-inactive-tab" data-bs-toggle="tab"\n                        data-bs-target="#subs-inactive" type="button" role="tab">\n                  Inactive ({len(subs_inactive)})\n                </button>\n              </li>\n            </ul>\n            <div class="tab-content mt-3" id="subsTabsContent">\n              <div class="tab-pane fade show active" id="subs-active" role="tabpanel"\n                   aria-labelledby="subs-active-tab">\n                <div class="table-responsive">\n                  <table class="table table-dark table-striped table-sm align-middle">\n                    <thead><tr><th>Subdomain</th><th>HTTP</th><th>HTTPS</th></tr></thead>\n                    <tbody>{(''.join(active_rows) if active_rows else "<tr><td colspan='3' class='text-muted'>No active subdomains.</td></tr>")}</tbody>\n                  </table>\n                </div>\n              </div>\n              <div class="tab-pane fade" id="subs-inactive" role="tabpanel"\n                   aria-labelledby="subs-inactive-tab">\n                <div class="table-responsive">\n                  <table class="table table-dark table-striped table-sm align-middle">\n                    <thead><tr><th>Subdomain</th><th>HTTP</th><th>HTTPS</th></tr></thead>\n                    <tbody>{(''.join(inactive_rows) if inactive_rows else "<tr><td colspan='3' class='text-muted'>No inactive subdomains.</td></tr>")}</tbody>\n                  </table>\n                </div>\n              </div>\n            </div>\n          </div>\n        </div>\n        """
+        subs_section = f"""
+        <div class="card mb-4">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h2 class="h6 mb-0">Subdomains</h2>
+            <span class="text-muted">Total: {len(subs_all)} | Active: {len(subs_active)} | Inactive: {len(subs_inactive)}</span>
+          </div>
+          <div class="card-body">
+            <ul class="nav nav-tabs" id="subs-tabs" role="tablist">
+              <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="subs-active-tab" data-bs-toggle="tab"
+                        data-bs-target="#subs-active" type="button" role="tab">
+                  Active ({len(subs_active)})
+                </button>
+              </li>
+              <li class="nav-item" role="presentation">
+                <button class="nav-link" id="subs-inactive-tab" data-bs-toggle="tab"
+                        data-bs-target="#subs-inactive" type="button" role="tab">
+                  Inactive ({len(subs_inactive)})
+                </button>
+              </li>
+            </ul>
+            <div class="tab-content mt-3" id="subsTabsContent">
+              <div class="tab-pane fade show active" id="subs-active" role="tabpanel">
+                <div class="table-responsive">
+                  <table class="table table-sm table-striped align-middle">
+                    <thead>
+                      <tr>
+                        <th>Subdomain</th>
+                        <th>HTTP</th>
+                        <th>HTTPS</th>
+                        <th>Clickjacking</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {''.join(active_rows) or "<tr><td colspan='4' class='text-muted'>No active subdomains.</td></tr>"}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div class="tab-pane fade" id="subs-inactive" role="tabpanel">
+                <div class="table-responsive">
+                  <table class="table table-sm table-striped align-middle">
+                    <thead>
+                      <tr>
+                        <th>Subdomain</th>
+                        <th>HTTP</th>
+                        <th>HTTPS</th>
+                        <th>Clickjacking</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {''.join(inactive_rows) or "<tr><td colspan='4' class='text-muted'>No inactive subdomains.</td></tr>"}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        """
     else:
-        subs_section = '\n        <div class="card mb-4">\n          <div class="card-header"><h2 class="h6 mb-0">Subdomains</h2></div>\n          <div class="card-body"><p class="mb-0 text-muted">No subdomains collected.</p></div>\n        </div>\n        '
+        subs_section = "\n        <div class=\"card mb-4\">\n          <div class=\"card-header\"><h2 class=\"h6 mb-0\">Subdomains</h2></div>\n          <div class=\"card-body\"><p class=\"mb-0 text-muted\">No subdomains collected.</p></div>\n        </div>\n        "
     dns_info = results.get('dns')
     if isinstance(dns_info, dict) and dns_info:
         dns_section = f'\n        <div class="card mb-4">\n          <div class="card-header"><h2 class="h6 mb-0">DNS Records</h2></div>\n          <div class="card-body">\n            <pre>{html_escape(json.dumps(dns_info, indent=2, ensure_ascii=False))}</pre>\n          </div>\n        </div>\n        '
@@ -471,12 +601,74 @@ def generate_html_report(domain: str, results: Dict[str, Any], out_dir: Path) ->
         nuclei_block = '\n        <div class="card mb-4">\n          <div class="card-header"><h2 class="h6 mb-0">Nuclei</h2></div>\n          <div class="card-body">\n            <p class="mb-0 text-muted">Nuclei configured but binary not found or not executed.</p>\n          </div>\n        </div>\n        '
     wpscan = results.get('wpscan', {})
     wpscan_block = ''
-    if isinstance(wpscan, dict) and wpscan.get('available'):
+    if isinstance(wpscan, dict) and (wpscan.get('available') or wpscan.get('wp_json_checks')):
         all_raw = wpscan.get('raw_output', '')
-        targets = wpscan.get('targets', [])
-        wpscan_block = f"""\n        <div class="card mb-4">\n          <div class="card-header"><h2 class="h6 mb-0">WPScan</h2></div>\n          <div class="card-body">\n            <p class="small text-muted mb-2">Targets: {html_escape(', '.join(targets))}</p>\n            <pre>{html_escape(all_raw)}</pre>\n          </div>\n        </div>\n        """
+        targets = wpscan.get('targets', []) or []
+        wp_checks = wpscan.get('wp_json_checks', []) or []
+
+        # tabela de /wp-json
+        rows_wp = []
+        for chk in wp_checks:
+            target = str(chk.get('target', '')).strip()
+            url = str(chk.get('wp_json_url', '')).strip()
+            status = chk.get('status')
+            status_str = str(status) if status is not None else (chk.get('error') or '-')
+            is_wp = chk.get('is_wordpress_like')
+            label = 'Yes' if is_wp else ('No' if status and status >= 200 and status < 400 else '-')
+            namespaces = chk.get('namespaces') or []
+            if namespaces:
+                ns_str = ', '.join(str(n) for n in namespaces[:10])
+            else:
+                ns_str = ''
+            rows_wp.append(
+                "<tr>"
+                f"<td>{html_escape(target)}</td>"
+                f"<td>{html_escape(url)}</td>"
+                f"<td>{html_escape(status_str)}</td>"
+                f"<td>{html_escape(label)}</td>"
+                f"<td><small>{html_escape(ns_str[:200])}</small></td>"
+                "</tr>"
+            )
+
+        if rows_wp:
+            wp_table = (
+                "<h3 class='h6 mt-3'>/wp-json checks</h3>"
+                "<div class='table-responsive'>"
+                "<table class='table table-sm table-striped align-middle'>"
+                "<thead><tr>"
+                "<th>Target</th><th>/wp-json URL</th><th>Status / Error</th><th>WordPress?</th><th>Namespaces</th>"
+                "</tr></thead><tbody>"
+                + "".join(rows_wp) +
+                "</tbody></table></div>"
+            )
+        else:
+            wp_table = "<p class='mb-0 text-muted'>No /wp-json checks recorded.</p>"
+
+        # bloco principal
+        wpscan_block = (
+            "\n        <div class='card mb-4'>\n"
+            "          <div class='card-header'><h2 class='h6 mb-0'>WordPress scan executed (WPScan)</h2></div>\n"
+            "          <div class='card-body'>\n"
+            f"            <p class='mb-2'>Targets: {html_escape(', '.join(targets))}</p>\n"
+            "            <p class='mb-2 text-muted'>WPScan foi executado. Review raw output e checagens de /wp-json abaixo.</p>\n"
+            f"            {wp_table}\n"
+            "            <hr class='my-3'>\n"
+            "            <h3 class='h6'>Raw WPScan output</h3>\n"
+            f"            <pre class='mb-0'>{html_escape(all_raw)}</pre>\n"
+            "          </div>\n"
+            "        </div>\n"
+            "        "
+        )
     elif wpscan:
-        wpscan_block = f"""\n        <div class="card mb-4">\n          <div class="card-header"><h2 class="h6 mb-0">WPScan</h2></div>\n          <div class="card-body">\n            <p class="mb-0 text-muted">WPScan not available: {html_escape(str(wpscan.get('error', 'Unknown error')))}</p>\n          </div>\n        </div>\n        """
+        wpscan_block = (
+            "\n        <div class='card mb-4'>\n"
+            "          <div class='card-header'><h2 class='h6 mb-0'>WordPress scan executed (WPScan)</h2></div>\n"
+            "          <div class='card-body'>\n"
+            "            <p class='mb-0 text-muted'>WPScan foi executado mas nenhum resultado estruturado foi registrado.</p>\n"
+            "          </div>\n"
+            "        </div>\n"
+            "        "
+        )
     shodan_info = results.get('shodan', {})
     shodan_block = ''
     if isinstance(shodan_info, dict) and shodan_info.get('available'):
@@ -494,12 +686,50 @@ def generate_html_report(domain: str, results: Dict[str, Any], out_dir: Path) ->
             types = sorted({str(leak.get('type', 'unknown')) for leak in leaks})
             types_str = ", ".join(types) if types else "None"
             count = len(leaks)
-            rows_js.append(f"<tr><td>{html_escape(url)}</td><td>{html_escape(types_str)}</td><td>{count}</td></tr>")
-        table_js = "<table class='table table-sm table-striped'><thead><tr><th>Script</th><th>Tipos detectados</th><th>Possíveis secrets</th></tr></thead><tbody>" + "".join(rows_js) + "</tbody></table>"
-        js_block = f"\n        <div class='card mb-4'>\n          <div class='card-header'><h2 class='h6 mb-0'>JavaScript Secrets / JS Key Hunter</h2></div>\n          <div class='card-body'>\n            <p class='text-muted mb-2'>Análise heurística de arquivos .js para detectar possíveis chaves/tokens sensíveis. Resultados exigem validação manual.</p>\n            {table_js}\n          </div>\n        </div>\n        "
+            jwt_decoded_list = [str(leak.get("decoded", "")).strip() for leak in leaks if leak.get("type") == "jwt_token" and leak.get("decoded")]
+            if jwt_decoded_list:
+                jwt_decoded_str = " | ".join(jwt_decoded_list[:2])
+            else:
+                jwt_decoded_str = "-"
+            rows_js.append(
+                "<tr>"
+                f"<td>{html_escape(url)}</td>"
+                f"<td>{html_escape(types_str)}</td>"
+                f"<td><pre class='mb-0'>{html_escape(jwt_decoded_str[:800])}</pre></td>"
+                f"<td>{count}</td>"
+                "</tr>"
+            )
+        table_js = (
+            "<table class='table table-sm table-striped align-middle'>"
+            "<thead><tr>"
+            "<th>Script</th>"
+            "<th>Tipos detectados</th>"
+            "<th>JWT decodificado</th>"
+            "<th>Possíveis secrets</th>"
+            "</tr></thead><tbody>"
+            + "".join(rows_js) +
+            "</tbody></table>"
+        )
+        js_block = (
+            "\n        <div class='card mb-4'>\n"
+            "          <div class='card-header'><h2 class='h6 mb-0'>JavaScript Secrets / JS Key Hunter</h2></div>\n"
+            "          <div class='card-body'>\n"
+            "            <p class='mb-2 text-muted'>Análise heurística de arquivos .js para detectar possíveis chaves/tokens sensíveis. Resultados exigem validação manual.</p>\n"
+            f"            {table_js}\n"
+            "          </div>\n"
+            "        </div>\n"
+            "        "
+        )
     elif js_info:
-        js_block = "\n        <div class='card mb-4'>\n          <div class='card-header'><h2 class='h6 mb-0'>JavaScript Secrets / JS Key Hunter</h2></div>\n          <div class='card-body'><p class='text-muted mb-0'>JS scan executado, mas nenhum dado relevante foi registrado.</p></div>\n        </div>\n        "
-
+        js_block = (
+            "\n        <div class='card mb-4'>\n"
+            "          <div class='card-header'><h2 class='h6 mb-0'>JavaScript Secrets / JS Key Hunter</h2></div>\n"
+            "          <div class='card-body'>\n"
+            "            <p class='mb-0 text-muted'>JSLeaks foi executado mas nenhum resultado relevante foi registrado.</p>\n"
+            "          </div>\n"
+            "        </div>\n"
+            "        "
+        )
     ascii_block = ASCII_WOLF
     html_doc = f"<!DOCTYPE html>\n<html lang='en'>\n<head>\n  <meta charset='utf-8'>\n  <title>UIVO Report - {html_escape(domain)}</title>\n  <meta name='viewport' content='width=device-width, initial-scale=1'>\n  <link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css' rel='stylesheet'>\n  <style>\n    body {{ background-color:#0b0c10; color:#c5c6c7; }}\n    .uivo-header {{ border-bottom:1px solid #45a29e; margin-bottom:1.5rem; padding-bottom:.75rem; }}\n    pre {{ background-color:#1f2833; color:#c5c6c7; padding:.5rem; border-radius:.25rem; font-size:0.8rem; white-space:pre-wrap; }}\n    .ascii-wolf {{ font-family:monospace; white-space:pre; line-height:1.1; font-size:8px; }}\n    a, a:visited {{ color:#66fcf1; }}\n  </style>\n</head>\n<body>\n  <div class='container my-4'>\n    <div class='uivo-header d-flex justify-content-between align-items-center'>\n      <div>\n        <h1 class='h3 mb-1'>UIVO Attack Surface Report</h1>\n        <div>Target: <strong>{html_escape(domain)}</strong></div>\n      </div>\n      <div class='ascii-wolf d-none d-md-block'>\n{ascii_block}\n      </div>\n    </div>\n\n    <div class='row mb-4'>\n      <div class='col-md-4'>\n        <div class='card'>\n          <div class='card-header'><h2 class='h6 mb-0'>Summary</h2></div>\n          <div class='card-body'>\n            <p class='mb-1'>Total findings: <strong>{len(findings)}</strong></p>\n            {''.join(sev_bars)}\n          </div>\n        </div>\n      </div>\n      <div class='col-md-8'>\n        <div class='card'>\n          <div class='card-header'><h2 class='h6 mb-0'>Findings</h2></div>\n          <div class='card-body'>\n            <div class='table-responsive'>\n              <table class='table table-dark table-striped table-sm align-middle'>\n                <thead>\n                  <tr>\n                    <th>Severity</th><th>Title</th><th>Endpoint</th><th>Details</th>\n                  </tr>\n                </thead>\n                <tbody>\n                  {''.join(rows)}\n                </tbody>\n              </table>\n            </div>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    {subs_section}\n    {dns_section}\n    {http_section}\n    {ssl_section}\n    {nuclei_block}\n    {wpscan_block}\n    {shodan_block}{js_block}\n\n  </div>\n  <script src='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js'></script>\n</body>\n</html>\n"
     out_path = out_dir / 'uivo_report.html'
@@ -569,6 +799,7 @@ class SubdomainsPlugin(UivoPlugin):
     def should_run(self, args) -> bool:
         return getattr(args, "subdomains", False)
 
+
     def run(self, ctx: ReconContext, args) -> Dict[str, Any]:
         from src import subdomains as _sd  # usa módulo dedicado
 
@@ -627,19 +858,64 @@ class SubdomainsPlugin(UivoPlugin):
                 print(f"[!] Brute force subdomain enumeration failed: {e}")
 
         subs_sorted = sorted(all_subs)
+        if not subs_sorted:
+            # Fallback: se nenhuma fonte retornou subdomínios,
+            # pelo menos garantir que o domínio principal seja considerado.
+            print("[!] Nenhuma fonte retornou subdomínios. Adicionando domínio principal como alvo.")
+            subs_sorted = [ctx.domain]
+
         print(f"[+] Total unique subdomains collected: {len(subs_sorted)}")
 
-        # 6) classificar ativos / inativos
+        # 6) classificar ativos / inativos e coletar cabeçalhos HTTP
         if subs_sorted:
             print("[*] Checking HTTP activity for subdomains ...")
-            active, inactive = classify_subdomains_activity(subs_sorted, threads=ctx.threads)
+            active, inactive, http_info = classify_subdomains_activity(subs_sorted, threads=ctx.threads)
             print(f"[+] Active subdomains: {len(active)} | Inactive: {len(inactive)}")
         else:
-            active, inactive = [], []
+            active, inactive, http_info = [], [], {}
 
         ctx.results["subdomains"] = subs_sorted
         ctx.results["subdomains_active"] = active
         ctx.results["subdomains_inactive"] = inactive
+        ctx.results["subdomains_http_info"] = http_info
+
+        # Geração de PoC de clickjacking para todos os subdomínios
+        if ctx.output_dir and http_info:
+            poc_dir = ctx.output_dir / "clickjacking_poc"
+            try:
+                poc_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            for host, info in http_info.items():
+                base_url_host = info.get("url") or f"http://{host}"
+                poc_filename = "clickj_" + host.replace(".", "_") + ".html"
+                poc_rel_path = "clickjacking_poc/" + poc_filename
+                poc_path = poc_dir / poc_filename
+                try:
+                    poc_lines = [
+                        "<!DOCTYPE html>",
+                        "<html lang='en'>",
+                        "<head>",
+                        "  <meta charset='utf-8'>",
+                        f"  <title>Clickjacking PoC - {host}</title>",
+                        "  <style>",
+                        "    body { font-family: sans-serif; background: #111; color: #ddd; }",
+                        "    h1 { font-size: 1.2rem; }",
+                        "    iframe { width: 100%; height: 800px; border: 3px solid #444; }",
+                        "  </style>",
+                        "</head>",
+                        "<body>",
+                        f"  <h1>Clickjacking PoC - {host}</h1>",
+                        "  <p>Esta página carrega o alvo em um iframe, demonstrando o impacto potencial de clickjacking.</p>",
+                        f"  <iframe src='{base_url_host}' sandbox='allow-forms allow-scripts allow-same-origin'></iframe>",
+                        "</body>",
+                        "</html>",
+                    ]
+                    poc_html = "\n".join(poc_lines)
+                    poc_path.write_text(poc_html, encoding="utf-8")
+                    info["clickj_poc"] = poc_rel_path
+                except Exception as e:
+                    info["clickj_error"] = str(e)
 
         # salva subdomains.json para reuso por Nuclei/WPScan
         if ctx.store and ctx.output_dir:
@@ -653,18 +929,38 @@ class SubdomainsPlugin(UivoPlugin):
             sub_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
             print("[+] Subdomains saved:", sub_file)
 
+        # gera arquivos subd.txt e _subd.txt na pasta atual de execução
+        try:
+            from pathlib import Path as _Path
+            cwd = _Path.cwd()
+            simple_lines = [str(h).strip() for h in subs_sorted if str(h).strip()]
+            if simple_lines:
+                subd_path = cwd / "subd.txt"
+                subd_path.write_text("\n".join(simple_lines) + "\n", encoding="utf-8")
+                print("[+] Subdomain list saved to:", subd_path)
+                url_lines = []
+                for h in simple_lines:
+                    url_lines.append(f"http://{h}")
+                    url_lines.append(f"https://{h}")
+                undersub_path = cwd / "_subd.txt"
+                undersub_path.write_text("\n".join(url_lines) + "\n", encoding="utf-8")
+                print("[+] Subdomain URL list saved to:", undersub_path)
+        except Exception as e:
+            print("[!] Failed to write subdomain list files:", e)
+
         return {
             "subdomains": subs_sorted,
             "subdomains_active": active,
             "subdomains_inactive": inactive,
         }
-
-
 @register_plugin
 class DNSPlugin(UivoPlugin):
     slug = "dns"
     name = "DNS"
     description = "DNS records."
+    order = 20
+
+
     order = 20
 
     def should_run(self, args) -> bool:
@@ -696,9 +992,67 @@ class HTTPPlugin(UivoPlugin):
 
     def run(self, ctx: ReconContext, args) -> Dict[str, Any]:
         print("[*] Fetching HTTP information ...")
-        info = get_http_information(ctx.domain)
+        info = get_http_information(ctx.domain) or {}
+
+        # salvar resultado bruto
         ctx.results["http"] = info
+
+        # gerar PoC de clickjacking para o domínio principal se não houver X-Frame-Options
+        headers = info.get("headers") or {}
+        if isinstance(headers, dict):
+            lowered = {str(k).lower(): str(v) for k, v in headers.items()}
+        else:
+            lowered = {}
+        xfo = lowered.get("x-frame-options")
+
+        if not xfo and ctx.output_dir:
+            poc_dir = ctx.output_dir / "clickjacking_poc"
+            try:
+                poc_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            base_url = info.get("url") or f"http://{ctx.domain}"
+            poc_filename = "clickj_" + ctx.domain.replace(".", "_") + ".html"
+            poc_rel_path = "clickjacking_poc/" + poc_filename
+            poc_path = poc_dir / poc_filename
+            try:
+                poc_lines = [
+                    "<!DOCTYPE html>",
+                    "<html lang='en'>",
+                    "<head>",
+                    "  <meta charset='utf-8'>",
+                    f"  <title>Clickjacking PoC - {ctx.domain}</title>",
+                    "  <style>",
+                    "    body { font-family: sans-serif; background: #111; color: #ddd; }",
+                    "    h1 { font-size: 1.2rem; }",
+                    "    iframe { width: 100%; height: 800px; border: 3px solid #444; }",
+                    "  </style>",
+                    "</head>",
+                    "<body>",
+                    f"  <h1>Clickjacking PoC - {ctx.domain}</h1>",
+                    "  <p>Esta página carrega o alvo em um iframe, demonstrando a ausência do cabeçalho X-Frame-Options.</p>",
+                    f"  <iframe src='{base_url}' sandbox='allow-forms allow-scripts allow-same-origin'></iframe>",
+                    "</body>",
+                    "</html>",
+                ]
+                poc_html = "\n".join(poc_lines)
+                poc_path.write_text(poc_html, encoding="utf-8")
+                info["clickj_poc"] = poc_rel_path
+
+                # também integrar com subdomains_http_info para aparecer na tabela de subdomínios
+                subs_http = ctx.results.get("subdomains_http_info") or {}
+                entry = subs_http.get(ctx.domain) or {}
+                entry.setdefault("url", base_url)
+                entry["headers"] = lowered
+                entry["clickj_poc"] = poc_rel_path
+                subs_http[ctx.domain] = entry
+                ctx.results["subdomains_http_info"] = subs_http
+            except Exception:
+                pass
+
         print("[+] HTTP info collected.")
+        return {"http": info}
+
         return {"http": info}
 
 
@@ -813,6 +1167,8 @@ class JSLeaksPlugin(UivoPlugin):
         import re
         import urllib.parse
         import requests
+        import base64
+        import json as _json
 
         http_info = ctx.results.get("http", {})
         base_url = http_info.get("url") or f"http://{ctx.domain}"
@@ -832,7 +1188,7 @@ class JSLeaksPlugin(UivoPlugin):
                 return ""
 
         def collect_js_from_html(url: str, html: str, source: str) -> None:
-            script_pattern = re.compile(r'<script[^>]+src=[\"\']([^"\']+\.js[^"\']*)[\"\']', re.IGNORECASE)
+            script_pattern = re.compile(r'<script[^>]+src=[\"\']([^\"\']+\.js[^\"\']*)[\"\']', re.IGNORECASE)
             for m in script_pattern.finditer(html):
                 src = m.group(1)
                 full = urllib.parse.urljoin(url, src)
@@ -845,7 +1201,7 @@ class JSLeaksPlugin(UivoPlugin):
             collect_js_from_html(base_url, main_html, "main")
 
             # 2) Crawling leve (nível 1) - apenas links internos
-            link_pattern = re.compile(r'<a[^>]+href=[\"\']([^"\']+)[\"\']', re.IGNORECASE)
+            link_pattern = re.compile(r'<a[^>]+href=[\"\']([^\"\']+)[\"\']', re.IGNORECASE)
             for m in link_pattern.finditer(main_html):
                 href = m.group(1)
                 full = urllib.parse.urljoin(base_url, href)
@@ -882,10 +1238,17 @@ class JSLeaksPlugin(UivoPlugin):
         secret_patterns: list[tuple[re.Pattern[str], str]] = [
             (re.compile(r"AKIA[0-9A-Z]{16}"), "aws_access_key"),
             (re.compile(r"AIza[0-9A-Za-z\-_]{35}"), "google_api_key"),
-            (re.compile(r"(?i)(api_key|apikey|api-key|token|secret|authorization|auth|password|passwd)\s*[:=]\s*[\"\']([^\"\']{8,})[\"\']"), "generic_credential"),
+            (re.compile(r"(?i)(api_key|apikey|api-key|token|secret|senha|password|pwd)\s*[:=]\s*[\"\']([^\"\']{8,})[\"\']"), "generic_credential"),
             (re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}"), "jwt_token"),
             (re.compile(r"Bearer\s+([A-Za-z0-9._\-]{20,})"), "bearer_token"),
         ]
+
+        def _b64url_decode(segment: str) -> str:
+            try:
+                padding = "=" * ((4 - len(segment) % 4) % 4)
+                return base64.urlsafe_b64decode(segment + padding).decode("utf-8", "ignore")
+            except Exception:
+                return ""
 
         scripts: list[dict] = []
 
@@ -907,7 +1270,26 @@ class JSLeaksPlugin(UivoPlugin):
                 try:
                     for m in pattern.finditer(content):
                         val = m.group(0)
-                        leaks.append({"type": stype, "match": val[:120]})
+                        leak: dict = {"type": stype, "match": val[:256]}
+                        if stype == "jwt_token":
+                            decoded = ""
+                            parts = val.split(".")
+                            if len(parts) >= 2:
+                                header = _b64url_decode(parts[0])
+                                payload = _b64url_decode(parts[1])
+                                if header or payload:
+                                    try:
+                                        # tentar pretty-print se forem JSON válidos
+                                        h_obj = _json.loads(header) if header else None
+                                        p_obj = _json.loads(payload) if payload else None
+                                        header_str = _json.dumps(h_obj, indent=2, ensure_ascii=False) if h_obj is not None else header
+                                        payload_str = _json.dumps(p_obj, indent=2, ensure_ascii=False) if p_obj is not None else payload
+                                        decoded = f"header: {header_str} | payload: {payload_str}"
+                                    except Exception:
+                                        decoded = f"header: {header} | payload: {payload}"
+                            if decoded:
+                                leak["decoded"] = decoded[:800]
+                        leaks.append(leak)
                 except Exception:
                     continue
 
@@ -918,6 +1300,7 @@ class JSLeaksPlugin(UivoPlugin):
         ctx.results["js_leaks"] = result
         print(f"[+] JS leaks: análise concluída. Scripts analisados: {len(scripts)}")
         return {"js_leaks": result}
+
 
 
 
@@ -939,7 +1322,12 @@ class WPScanPlugin(UivoPlugin):
         return "wpscan" in [m.strip() for m in modules.split(",") if m.strip()]
 
     def run(self, ctx: ReconContext, args) -> Dict[str, Any]:
-        wpscan_summary: Dict[str, Any] = {"available": False, "targets": [], "results": [], "raw_output": ""}
+        wpscan_summary: Dict[str, Any] = {
+            "available": False,
+            "targets": [],
+            "results": [],
+            "raw_output": "",
+        }
 
         # usar subdomínios ATIVOS de preferência
         subs = ctx.results.get("subdomains_active") or ctx.results.get("subdomains") or []
@@ -952,7 +1340,7 @@ class WPScanPlugin(UivoPlugin):
                 except Exception:
                     pass
 
-        http_info = ctx.results.get("http", {})
+        http_info = ctx.results.get("http", {}) or {}
         main_url = http_info.get("url") or f"http://{ctx.domain}"
 
         # targets: domínio principal + alguns subdomínios ATIVOS (limite para evitar scan infinito)
@@ -967,6 +1355,39 @@ class WPScanPlugin(UivoPlugin):
         for t in targets:
             print("   -", t)
 
+        # antes de rodar o WPScan, testar /wp-json em cada alvo
+        wp_json_checks: list[dict] = []
+
+        def check_wp_json(u: str) -> dict:
+            base = u.rstrip("/")
+            wp_url = base + "/wp-json"
+            info: dict = {"target": u, "wp_json_url": wp_url}
+            try:
+                r = requests.get(wp_url, timeout=10, verify=False)
+            except Exception as e:
+                info["error"] = str(e)
+                return info
+            info["status"] = r.status_code
+            text_sample = (r.text or "")[:4000]
+            if 200 <= r.status_code < 400:
+                is_wp = ("\"namespaces\"" in text_sample) or ("\"wp/" in text_sample) or ("wp-json" in text_sample)
+                info["is_wordpress_like"] = bool(is_wp)
+                try:
+                    data = r.json()
+                    if isinstance(data, dict):
+                        namespaces = data.get("namespaces")
+                        if isinstance(namespaces, list):
+                            info["namespaces"] = namespaces[:25]
+                except Exception:
+                    pass
+            return info
+
+        for t in targets:
+            try:
+                wp_json_checks.append(check_wp_json(t))
+            except Exception as e:
+                wp_json_checks.append({"target": t, "error": str(e)})
+
         all_raw_parts: list[str] = []
         for t in targets:
             res = run_wpscan(t, args.wpscan_api_token)
@@ -978,6 +1399,7 @@ class WPScanPlugin(UivoPlugin):
 
         wpscan_summary["targets"] = targets
         wpscan_summary["raw_output"] = "\n".join(all_raw_parts)
+        wpscan_summary["wp_json_checks"] = wp_json_checks
 
         ctx.results["wpscan"] = wpscan_summary
         if wpscan_summary.get("available"):
@@ -985,6 +1407,7 @@ class WPScanPlugin(UivoPlugin):
         else:
             print("[!] WPScan not available.")
         return {"wpscan": wpscan_summary}
+
 
 
 @register_plugin
